@@ -6,10 +6,13 @@ when ``memory.injection_enabled`` is True in the app config.  Both are delivered
 per conversation as a dedicated <system-reminder> SystemMessage inserted before the
 first user message (frozen-snapshot pattern).
 
-When a conversation spans midnight the middleware detects the date change and injects
-a lightweight date-update reminder as a separate SystemMessage before the current turn.
-This correction is persisted so subsequent turns on the new day see a consistent history
-and do not re-inject.
+When a conversation spans midnight the middleware detects the date change and refreshes
+the existing date-reminder SystemMessage in place (same message ID).  Refreshing the
+front reminder — rather than injecting a *new* SystemMessage next to the current turn —
+keeps all system messages consecutive at the front of the history.  The Anthropic API
+rejects non-consecutive system messages ("Received multiple non-consecutive system
+messages"), which a mid-conversation date reminder would trigger.  This correction is
+persisted so subsequent turns on the new day see a consistent history and do not re-inject.
 
 Reminder format:
 
@@ -103,6 +106,22 @@ def _last_injected_date(messages: list) -> str | None:
     return None
 
 
+def _is_date_reminder_system(message: object) -> bool:
+    """Return whether *message* is the framework date-reminder SystemMessage.
+
+    Mirrors ``_last_injected_date`` detection: the flagged reminder, or — for
+    pre-``reminder_date`` checkpoints — any SystemMessage whose content carries a
+    ``<current_date>`` tag. Used by the midnight-crossing path to locate the
+    reminder to refresh in place (keeping system messages consecutive).
+    """
+    if not isinstance(message, SystemMessage):
+        return False
+    if bool(message.additional_kwargs.get(_DYNAMIC_CONTEXT_REMINDER_KEY)):
+        return True
+    content_str = message.content if isinstance(message.content, str) else str(message.content)
+    return _extract_date(content_str) is not None
+
+
 def _is_user_injection_target(message: object) -> bool:
     """Return whether *message* can receive a dynamic-context reminder."""
     return isinstance(message, HumanMessage) and not is_dynamic_context_reminder(message) and message.name != _SUMMARY_MESSAGE_NAME
@@ -121,9 +140,12 @@ class DynamicContextMiddleware(AgentMiddleware):
     Midnight crossing
     -----------------
     If the conversation spans midnight, the current date differs from the date that
-    was injected earlier.  In that case a lightweight date-update reminder is prepended
-    to the **current** (last) HumanMessage and persisted.  Subsequent turns on the new
-    day see the corrected date in history and skip re-injection.
+    was injected earlier.  In that case the existing date-reminder SystemMessage at the
+    front of the history is refreshed in place (same ID) with the new date and persisted.
+    This keeps system messages consecutive (Anthropic rejects non-consecutive system
+    messages); injecting a fresh SystemMessage next to the current turn would land it
+    mid-conversation and break the request.  Subsequent turns on the new day see the
+    corrected date in history and skip re-injection.
     """
 
     def __init__(self, agent_name: str | None = None, *, app_config: AppConfig | None = None):
@@ -254,14 +276,33 @@ class DynamicContextMiddleware(AgentMiddleware):
             # ── Same day: nothing to do ──────────────────────────────────────────
             return None
 
-        # ── Midnight crossed: inject date-update reminder as a SystemMessage ──
-        last_human_idx = next((i for i in reversed(range(len(messages))) if _is_user_injection_target(messages[i])), None)
-        if last_human_idx is None:
+        # ── Midnight crossed: refresh the existing date reminder in place ──
+        # Replacing the persisted date SystemMessage by its own ID keeps every
+        # system message consecutive at the front of the history. Injecting a
+        # *new* SystemMessage next to the current turn instead lands it
+        # mid-conversation (after AI/human turns), which the Anthropic API
+        # rejects with "Received multiple non-consecutive system messages".
+        reminder_idx = next(
+            (i for i in reversed(range(len(messages))) if _is_date_reminder_system(messages[i])),
+            None,
+        )
+        if reminder_idx is None:
+            # No SystemMessage reminder to refresh (e.g. legacy HumanMessage-only
+            # checkpoint). Skip rather than re-introduce a mid-conversation system.
             return None
 
-        result_msgs = self._make_reminder_and_user_messages(messages[last_human_idx], self._build_date_update_reminder(), reminder_date=current_date)
-        logger.info("DynamicContextMiddleware: midnight crossing detected — injected date update before current turn")
-        return {"messages": result_msgs}
+        existing = messages[reminder_idx]
+        refreshed = SystemMessage(
+            content=self._build_date_update_reminder(),
+            id=existing.id,
+            additional_kwargs={
+                "hide_from_ui": True,
+                _DYNAMIC_CONTEXT_REMINDER_KEY: True,
+                _REMINDER_DATE_KEY: current_date,
+            },
+        )
+        logger.info("DynamicContextMiddleware: midnight crossing detected — refreshed date reminder in place (id=%r)", existing.id)
+        return {"messages": [refreshed]}
 
     @override
     def before_agent(self, state, runtime: Runtime) -> dict | None:

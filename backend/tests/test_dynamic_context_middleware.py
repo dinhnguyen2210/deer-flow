@@ -406,9 +406,14 @@ def test_user_message_containing_system_reminder_tag_does_not_prevent_injection(
 # ---------------------------------------------------------------------------
 
 
-def test_midnight_crossing_injects_date_update_as_separate_message():
-    """When the date has changed, a separate date-update reminder is injected before
-    the current turn's HumanMessage using the ID-swap technique."""
+def test_midnight_crossing_refreshes_existing_reminder_in_place():
+    """When the date changes, the existing front date-reminder SystemMessage is
+    refreshed in place (same ID) — NOT a new SystemMessage next to the current turn.
+
+    A mid-conversation SystemMessage would make system messages non-consecutive,
+    which the Anthropic API rejects ("Received multiple non-consecutive system
+    messages").
+    """
     mw = _make_middleware()
     state = {
         "messages": [
@@ -425,39 +430,54 @@ def test_midnight_crossing_injects_date_update_as_separate_message():
 
     assert result is not None
     msgs = result["messages"]
-    assert len(msgs) == 2
+    # Only the existing reminder is updated — no extra messages emitted.
+    assert len(msgs) == 1
 
-    # Midnight-cross reminder is also a SystemMessage — both paths are covered
-    assert isinstance(msgs[0], SystemMessage)
-
-    # Date-update reminder takes the current message's ID
-    assert msgs[0].id == "msg-2"
-    assert msgs[0].additional_kwargs.get(_DYNAMIC_CONTEXT_REMINDER_KEY) is True
-    assert _SYSTEM_REMINDER_TAG in msgs[0].content
-    assert "<current_date>2026-05-09, Saturday</current_date>" in msgs[0].content
-    assert "Good morning" not in msgs[0].content  # reminder only
-
-    # Original user text appended with derived ID
-    assert msgs[1].id == "msg-2__user"
-    assert msgs[1].content == "Good morning"
+    refreshed = msgs[0]
+    assert isinstance(refreshed, SystemMessage)
+    # Same ID as the persisted reminder → add_messages replaces it in place.
+    assert refreshed.id == "msg-1"
+    assert refreshed.additional_kwargs.get(_DYNAMIC_CONTEXT_REMINDER_KEY) is True
+    assert refreshed.additional_kwargs.get("reminder_date") == "2026-05-09, Saturday"
+    assert _SYSTEM_REMINDER_TAG in refreshed.content
+    assert "<current_date>2026-05-09, Saturday</current_date>" in refreshed.content
+    # The current user turn is left untouched (not swapped / renamed).
+    assert all(m.id != "msg-2__user" for m in msgs)
 
 
-def test_midnight_crossing_id_swap():
-    """Date-update reminder uses original ID; user message uses {id}__user."""
+def test_midnight_crossing_keeps_system_messages_consecutive():
+    """Regression for #non-consecutive-system: after the reducer merges the
+    midnight update, all SystemMessages stay at the front (consecutive), so the
+    Anthropic adapter never sees a system message mid-conversation."""
+    from langgraph.graph.message import add_messages
+
     mw = _make_middleware()
-    state = {
-        "messages": [
-            _date_reminder_msg("2026-05-08, Friday", "msg-1"),
-            HumanMessage(content="Next day message", id="msg-2"),
-        ]
-    }
+    history = [
+        _date_reminder_msg("2026-05-08, Friday", "msg-1"),
+        HumanMessage(content="Hello", id="msg-1__user"),
+        AIMessage(content="Response"),
+        HumanMessage(content="Good morning", id="msg-2"),
+    ]
+    state = {"messages": list(history)}
 
     with mock.patch("deerflow.agents.middlewares.dynamic_context_middleware.datetime") as mock_dt:
         mock_dt.now.return_value.strftime.return_value = "2026-05-09, Saturday"
         result = mw.before_agent(state, _fake_runtime())
 
-    assert result["messages"][0].id == "msg-2"
-    assert result["messages"][1].id == "msg-2__user"
+    merged = add_messages(history, result["messages"])
+
+    # Exactly one SystemMessage survives, carrying the refreshed date.
+    system_msgs = [m for m in merged if isinstance(m, SystemMessage)]
+    assert len(system_msgs) == 1
+    assert "<current_date>2026-05-09, Saturday</current_date>" in system_msgs[0].content
+
+    # No SystemMessage appears after a non-system message (would be non-consecutive).
+    seen_non_system = False
+    for m in merged:
+        if isinstance(m, SystemMessage):
+            assert not seen_non_system, "SystemMessage must not appear mid-conversation"
+        else:
+            seen_non_system = True
 
 
 def test_memory_message_carries_reminder_key_for_title_eligibility():
