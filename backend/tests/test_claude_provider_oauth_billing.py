@@ -5,8 +5,13 @@ import json
 from unittest import mock
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from deerflow.models.claude_provider import OAUTH_BILLING_HEADER, ClaudeChatModel
+from deerflow.models.claude_provider import (
+    OAUTH_BILLING_HEADER,
+    ClaudeChatModel,
+    _ensure_consecutive_system_messages,
+)
 
 
 def _make_model() -> ClaudeChatModel:
@@ -152,3 +157,70 @@ def test_async_create_strips_cache_control_from_oauth_payload(model):
     assert "cache_control" not in sent_payload["system"][0]
     assert "cache_control" not in sent_payload["messages"][0]["content"][0]
     assert "cache_control" not in sent_payload["tools"][0]
+
+
+# ---------------------------------------------------------------------------
+# Non-consecutive system message normalization (Anthropic API constraint)
+# ---------------------------------------------------------------------------
+
+
+def test_demotes_noncontiguous_system_message():
+    """A SystemMessage after a non-system message is demoted to HumanMessage."""
+    msgs = [
+        SystemMessage(content="lead prompt"),
+        HumanMessage(content="summary...", name="summary"),
+        SystemMessage(content="<current_date>2026-06-24</current_date>", additional_kwargs={"reminder_date": "2026-06-24"}),
+        HumanMessage(content="question", name="user-input"),
+    ]
+    out, demoted = _ensure_consecutive_system_messages(msgs)
+
+    assert demoted == 1
+    assert [m.type for m in out] == ["system", "human", "human", "human"]
+    # Demoted message keeps content + kwargs and is hidden from the UI.
+    demoted_msg = out[2]
+    assert isinstance(demoted_msg, HumanMessage)
+    assert "current_date" in demoted_msg.content
+    assert demoted_msg.additional_kwargs.get("reminder_date") == "2026-06-24"
+    assert demoted_msg.additional_kwargs.get("hide_from_ui") is True
+
+
+def test_leading_system_block_preserved():
+    """Consecutive leading system messages are all kept as system."""
+    msgs = [
+        SystemMessage(content="billing"),
+        SystemMessage(content="lead prompt"),
+        SystemMessage(content="date reminder"),
+        HumanMessage(content="hi"),
+    ]
+    out, demoted = _ensure_consecutive_system_messages(msgs)
+    assert demoted == 0
+    assert [m.type for m in out] == ["system", "system", "system", "human"]
+
+
+def test_no_system_messages_unchanged():
+    msgs = [HumanMessage(content="hi"), AIMessage(content="hello")]
+    out, demoted = _ensure_consecutive_system_messages(msgs)
+    assert demoted == 0
+    assert out == msgs
+
+
+def test_get_request_payload_handles_summary_pushed_date_reminder(model):
+    """Regression: summarization places a summary HumanMessage before the date
+    reminder SystemMessage, so the model sees [system, human, system, ...].
+    _get_request_payload must normalize that instead of raising
+    "Received multiple non-consecutive system messages"."""
+    msgs = [
+        SystemMessage(content="You are DeerFlow."),
+        HumanMessage(content="Here is a summary...", name="summary"),
+        SystemMessage(content="<current_date>2026-06-24, Wednesday</current_date>", additional_kwargs={"dynamic_context_reminder": True}),
+        HumanMessage(content="2+2?", name="user-input"),
+    ]
+
+    # Must not raise; system content is folded into the top-level system param.
+    payload = model._get_request_payload(msgs)
+
+    roles = [m["role"] for m in payload["messages"]]
+    # No system role survives in the message list (folded into top-level system),
+    # and the now-consecutive human messages merge into a single user turn.
+    assert "system" not in roles
+    assert roles == ["user"]

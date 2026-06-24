@@ -26,13 +26,56 @@ from typing import Any
 
 import anthropic
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from pydantic import PrivateAttr
 
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 THINKING_BUDGET_RATIO = 0.8
+
+
+def _ensure_consecutive_system_messages(messages: list[BaseMessage]) -> tuple[list[BaseMessage], int]:
+    """Demote any ``SystemMessage`` outside the leading block to a ``HumanMessage``.
+
+    The Anthropic API only accepts system content as a single top-level block, so
+    ``langchain_anthropic`` raises "Received multiple non-consecutive system
+    messages" if a ``SystemMessage`` appears after any non-system message. DeerFlow
+    can produce that layout from several independent sources — a date reminder
+    pushed down by a summary message, a checkpoint poisoned before the midnight
+    fix, or any future middleware — so this provider-level guard makes every
+    request Anthropic-safe regardless of upstream ordering.
+
+    The leading consecutive run of system messages (the real system prompt, the
+    OAuth billing block, the date reminder when it stays at the front) is kept as
+    system. Any later system message is converted in place to a hidden
+    ``HumanMessage`` (content/id/name/kwargs preserved). Returns the rewritten list
+    and the number of demotions.
+    """
+    result: list[BaseMessage] = []
+    in_leading_block = True
+    demoted = 0
+    for message in messages:
+        if isinstance(message, SystemMessage):
+            if in_leading_block:
+                result.append(message)
+                continue
+            kwargs = dict(getattr(message, "additional_kwargs", {}) or {})
+            kwargs.setdefault("hide_from_ui", True)
+            result.append(
+                HumanMessage(
+                    content=message.content,
+                    id=getattr(message, "id", None),
+                    name=getattr(message, "name", None),
+                    additional_kwargs=kwargs,
+                )
+            )
+            demoted += 1
+        else:
+            in_leading_block = False
+            result.append(message)
+    return result, demoted
+
 
 # Billing header required by Anthropic API for OAuth token access.
 # Must be the first system prompt block. Format mirrors Claude Code CLI.
@@ -139,7 +182,16 @@ class ClaudeChatModel(ChatAnthropic):
         **kwargs: Any,
     ) -> dict:
         """Override to inject prompt caching, thinking budget, and OAuth billing."""
-        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        # Anthropic requires all system content to be consecutive at the front.
+        # Normalize first so any mid-conversation SystemMessage (summary push-down,
+        # poisoned checkpoint, etc.) cannot raise "multiple non-consecutive system
+        # messages" inside super()._get_request_payload -> _format_messages.
+        messages = self._convert_input(input_).to_messages()
+        messages, demoted = _ensure_consecutive_system_messages(messages)
+        if demoted:
+            logger.warning("ClaudeChatModel: demoted %d non-leading SystemMessage(s) to HumanMessage to keep system content consecutive", demoted)
+
+        payload = super()._get_request_payload(messages, stop=stop, **kwargs)
 
         if self._is_oauth:
             self._apply_oauth_billing(payload)
