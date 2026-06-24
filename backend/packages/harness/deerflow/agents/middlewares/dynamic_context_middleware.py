@@ -244,20 +244,54 @@ class DynamicContextMiddleware(AgentMiddleware):
         )
         return messages
 
+    @staticmethod
+    def _heal_stray_reminder_systems(messages: list) -> list:
+        """Demote any mid-conversation date-reminder ``SystemMessage`` to a hidden
+        ``HumanMessage`` (same ID, reducer replaces in place).
+
+        Self-heals checkpoints poisoned before the in-place midnight fix landed:
+        the old midnight path persisted a SystemMessage after ai/human turns, which
+        the Anthropic API rejects ("Received multiple non-consecutive system
+        messages"). A reminder SystemMessage is legitimate only inside the leading
+        block (before the first real conversation message); any later one is stray.
+        Demoting preserves ``reminder_date``/flags so date detection is unaffected.
+        """
+        repairs: list = []
+        seen_conversation = False
+        for m in messages:
+            if is_dynamic_context_reminder(m):
+                if isinstance(m, SystemMessage) and seen_conversation:
+                    repairs.append(HumanMessage(content=m.content, id=m.id, additional_kwargs=dict(m.additional_kwargs)))
+                continue
+            if not isinstance(m, SystemMessage):
+                # A real conversation message (human/ai/tool) ends the leading block.
+                seen_conversation = True
+        return repairs
+
     def _inject(self, state) -> dict | None:
         messages = list(state.get("messages", []))
         if not messages:
             return None
 
+        heal = self._heal_stray_reminder_systems(messages)
+        if heal:
+            logger.info("DynamicContextMiddleware: healing %d stray mid-conversation reminder SystemMessage(s)", len(heal))
+
         current_date = datetime.now().strftime("%Y-%m-%d, %A")
         last_date = _last_injected_date(messages)
         logger.debug(
-            "DynamicContextMiddleware._inject: msg_count=%d last_date=%r current_date=%r",
+            "DynamicContextMiddleware._inject: msg_count=%d last_date=%r current_date=%r heal=%d",
             len(messages),
             last_date,
             current_date,
+            len(heal),
         )
 
+        date_update = self._compute_date_update(messages, last_date, current_date)
+        combined = heal + (date_update or [])
+        return {"messages": combined} if combined else None
+
+    def _compute_date_update(self, messages: list, last_date: str | None, current_date: str) -> list | None:
         if last_date is None:
             # ── First turn: inject full reminder as a SystemMessage ─────
             first_idx = next((i for i, m in enumerate(messages) if _is_user_injection_target(m)), None)
@@ -270,7 +304,7 @@ class DynamicContextMiddleware(AgentMiddleware):
                 messages[first_idx].id,
             )
             result_msgs = self._make_reminder_and_user_messages(messages[first_idx], date_reminder, memory_block, reminder_date=current_date)
-            return {"messages": result_msgs}
+            return result_msgs
 
         if last_date == current_date:
             # ── Same day: nothing to do ──────────────────────────────────────────
@@ -282,8 +316,11 @@ class DynamicContextMiddleware(AgentMiddleware):
         # *new* SystemMessage next to the current turn instead lands it
         # mid-conversation (after AI/human turns), which the Anthropic API
         # rejects with "Received multiple non-consecutive system messages".
+        # Refresh the FRONT (first) date reminder — it lives in the leading
+        # consecutive block, so updating it never creates a mid-conversation
+        # system. (Stray later reminders are demoted separately by healing.)
         reminder_idx = next(
-            (i for i in reversed(range(len(messages))) if _is_date_reminder_system(messages[i])),
+            (i for i, m in enumerate(messages) if _is_date_reminder_system(m)),
             None,
         )
         if reminder_idx is None:
@@ -302,7 +339,7 @@ class DynamicContextMiddleware(AgentMiddleware):
             },
         )
         logger.info("DynamicContextMiddleware: midnight crossing detected — refreshed date reminder in place (id=%r)", existing.id)
-        return {"messages": [refreshed]}
+        return [refreshed]
 
     @override
     def before_agent(self, state, runtime: Runtime) -> dict | None:

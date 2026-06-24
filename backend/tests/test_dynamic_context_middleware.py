@@ -519,15 +519,16 @@ def test_memory_message_carries_reminder_key_for_title_eligibility():
 
 
 def test_no_second_midnight_injection_once_date_updated():
-    """After a midnight update is persisted, the same-day path skips re-injection."""
+    """After a midnight update is persisted (front reminder refreshed in place),
+    the same-day path skips re-injection. The healthy layout has a single front
+    reminder carrying the new date — no mid-conversation reminder."""
     mw = _make_middleware()
     state = {
         "messages": [
-            _date_reminder_msg("2026-05-08, Friday", "msg-1"),
+            _date_reminder_msg("2026-05-09, Saturday", "msg-1"),  # refreshed in place to new date
             HumanMessage(content="Hello", id="msg-1__user"),
             AIMessage(content="Response"),
-            _date_reminder_msg("2026-05-09, Saturday", "msg-2"),
-            HumanMessage(content="Good morning", id="msg-2__user"),
+            HumanMessage(content="Good morning", id="msg-2"),
             AIMessage(content="Good morning!"),
             HumanMessage(content="Third turn", id="msg-3"),
         ]
@@ -537,4 +538,47 @@ def test_no_second_midnight_injection_once_date_updated():
         mock_dt.now.return_value.strftime.return_value = "2026-05-09, Saturday"
         result = mw.before_agent(state, _fake_runtime())
 
-    assert result is None  # same day as last injected date → no update
+    assert result is None  # same day, single front reminder → no update, nothing to heal
+
+
+def test_heals_poisoned_mid_conversation_reminder():
+    """Self-heal: a date-reminder SystemMessage persisted mid-conversation (by the
+    pre-fix midnight path) is demoted to a HumanMessage in place, so the Anthropic
+    adapter no longer sees a non-consecutive system message.
+
+    Same-day so no date update is produced — only the heal repair is emitted.
+    """
+    from langgraph.graph.message import add_messages
+
+    mw = _make_middleware()
+    history = [
+        _date_reminder_msg("2026-06-24, Wednesday", "msg-1"),  # legit front reminder
+        HumanMessage(content="Hello", id="msg-1__user"),
+        AIMessage(content="Response"),
+        _date_reminder_msg("2026-06-24, Wednesday", "stray"),  # POISONED: mid-conversation system
+        HumanMessage(content="Good morning", id="stray__user"),
+    ]
+    state = {"messages": list(history)}
+
+    with mock.patch("deerflow.agents.middlewares.dynamic_context_middleware.datetime") as mock_dt:
+        mock_dt.now.return_value.strftime.return_value = "2026-06-24, Wednesday"
+        result = mw.before_agent(state, _fake_runtime())
+
+    assert result is not None
+    repairs = result["messages"]
+    # Only the stray reminder is repaired — demoted to HumanMessage with same ID.
+    assert len(repairs) == 1
+    assert repairs[0].id == "stray"
+    assert isinstance(repairs[0], HumanMessage)
+    assert repairs[0].additional_kwargs.get(_DYNAMIC_CONTEXT_REMINDER_KEY) is True
+
+    # After the reducer merges, no SystemMessage sits mid-conversation.
+    merged = add_messages(history, repairs)
+    seen_non_system = False
+    for m in merged:
+        if isinstance(m, SystemMessage):
+            assert not seen_non_system, "SystemMessage must not appear mid-conversation after heal"
+        else:
+            seen_non_system = True
+    # The legit front reminder stays a SystemMessage.
+    assert isinstance(merged[0], SystemMessage)
