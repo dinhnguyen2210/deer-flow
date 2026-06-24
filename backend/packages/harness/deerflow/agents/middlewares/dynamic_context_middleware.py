@@ -574,21 +574,57 @@ class DynamicContextMiddleware(AgentMiddleware):
         )
         return messages
 
+    @staticmethod
+    def _heal_stray_reminder_systems(messages: list) -> list:
+        """Demote any mid-conversation date-reminder ``SystemMessage`` to a hidden
+        ``HumanMessage`` (same ID, reducer replaces in place).
+
+        Self-heals checkpoints poisoned before the in-place midnight fix landed:
+        the old midnight path persisted a SystemMessage after ai/human turns, which
+        the Anthropic API rejects ("Received multiple non-consecutive system
+        messages"). A reminder SystemMessage is legitimate only inside the leading
+        block (before the first real conversation message); any later one is stray.
+        Demoting preserves ``reminder_date``/flags so date detection is unaffected.
+        """
+        repairs: list = []
+        seen_conversation = False
+        for m in messages:
+            if is_dynamic_context_reminder(m):
+                if isinstance(m, SystemMessage) and seen_conversation:
+                    repairs.append(HumanMessage(content=m.content, id=m.id, additional_kwargs=dict(m.additional_kwargs)))
+                continue
+            if not isinstance(m, SystemMessage):
+                # A real conversation message (human/ai/tool) ends the leading block.
+                seen_conversation = True
+        return repairs
+
     def _inject(self, state, runtime: Runtime | None = None) -> dict | None:
         messages = list(state.get("messages", []))
         if not messages:
             return None
         memory_removals = self._disabled_memory_removals(messages)
 
+        heal = self._heal_stray_reminder_systems(messages)
+        if heal:
+            logger.info("DynamicContextMiddleware: healing %d stray mid-conversation reminder SystemMessage(s)", len(heal))
+
         current_date = _format_current_date()
         last_date = _last_injected_date(messages)
         logger.debug(
-            "DynamicContextMiddleware._inject: msg_count=%d last_date=%r current_date=%r",
+            "DynamicContextMiddleware._inject: msg_count=%d last_date=%r current_date=%r heal=%d",
             len(messages),
             last_date,
             current_date,
+            len(heal),
         )
 
+        # memory_removals and heal are applied unconditionally; _compute_date_update
+        # returns only date-reminder messages (or None), so merge all three here.
+        date_update = self._compute_date_update(messages, last_date, current_date, runtime)
+        combined = [*heal, *memory_removals, *(date_update or [])]
+        return {"messages": combined} if combined else None
+
+    def _compute_date_update(self, messages: list, last_date: str | None, current_date: str, runtime: Runtime | None = None) -> list | None:
         if last_date is None:
             # ── First turn: inject full reminder as a SystemMessage ─────
             #
@@ -603,19 +639,18 @@ class DynamicContextMiddleware(AgentMiddleware):
             # the stale first message as if it were the current turn.
             target_idx = next((i for i in reversed(range(len(messages))) if _is_user_injection_target(messages[i])), None)
             if target_idx is None:
-                return {"messages": memory_removals} if memory_removals else None
+                return None
             date_reminder, memory_block = self._build_full_reminder(runtime, query=_derive_injection_query(messages[target_idx]))
             logger.info(
                 "DynamicContextMiddleware: injecting full reminder (has_memory=%s) into last HumanMessage id=%r",
                 memory_block is not None,
                 messages[target_idx].id,
             )
-            result_msgs = self._make_reminder_and_user_messages(messages[target_idx], date_reminder, memory_block, reminder_date=current_date)
-            return {"messages": [*memory_removals, *result_msgs]}
+            return self._make_reminder_and_user_messages(messages[target_idx], date_reminder, memory_block, reminder_date=current_date)
 
         if last_date == current_date:
             # ── Same day: nothing to do ──────────────────────────────────────────
-            return {"messages": memory_removals} if memory_removals else None
+            return None
 
         # ── Midnight crossed: refresh the existing date reminder in place ──
         # Replacing the persisted date SystemMessage by its own ID keeps every
@@ -623,15 +658,18 @@ class DynamicContextMiddleware(AgentMiddleware):
         # *new* SystemMessage next to the current turn instead lands it
         # mid-conversation (after AI/human turns), which the Anthropic API
         # rejects with "Received multiple non-consecutive system messages".
+        # Refresh the FRONT (first) date reminder — it lives in the leading
+        # consecutive block, so updating it never creates a mid-conversation
+        # system. (Stray later reminders are demoted separately by healing.)
         reminder_idx = next(
-            (i for i in reversed(range(len(messages))) if _is_date_reminder_system(messages[i])),
+            (i for i, m in enumerate(messages) if _is_date_reminder_system(m)),
             None,
         )
         if reminder_idx is None:
             # No SystemMessage reminder to refresh (e.g. legacy HumanMessage-only
             # checkpoint). Skip the date refresh rather than re-introduce a
-            # mid-conversation system, but still apply any memory removals.
-            return {"messages": memory_removals} if memory_removals else None
+            # mid-conversation system. (memory_removals are applied by _inject.)
+            return None
 
         existing = messages[reminder_idx]
         refreshed = SystemMessage(
@@ -644,7 +682,7 @@ class DynamicContextMiddleware(AgentMiddleware):
             },
         )
         logger.info("DynamicContextMiddleware: midnight crossing detected — refreshed date reminder in place (id=%r)", existing.id)
-        return {"messages": [*memory_removals, refreshed]}
+        return [refreshed]
 
     @override
     def before_agent(self, state, runtime: Runtime) -> dict | None:
