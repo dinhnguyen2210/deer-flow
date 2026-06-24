@@ -6,6 +6,8 @@ the exact same rewriting behavior.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from deerflow.sandbox.local.local_sandbox import LocalSandbox, PathMapping
 
@@ -97,3 +99,52 @@ def test_read_only_mount_detected(tmp_path):
     ws_local = str((tmp_path / "workspace").resolve())
     assert sb._is_read_only_path(f"{skills_local}/a.md") is True
     assert sb._is_read_only_path(f"{ws_local}/a.txt") is False
+
+
+# ---------------------------------------------------------------------------
+# Windows / Git Bash (MSYS) path emission
+# ---------------------------------------------------------------------------
+
+
+def test_command_posix_paths_normalizes_backslashes(tmp_path):
+    """With posix_paths=True the resolved host path uses forward slashes.
+
+    On Windows the native resolution yields a backslash path (e.g. ``D:\\a\\b``);
+    Git Bash `sh` eats those backslashes as escapes and destroys the path. The
+    posix variant must contain no backslashes and equal the native output with
+    `\\` -> `/`. On POSIX hosts there are no backslashes, so both are identical.
+    """
+    sb = _make_sandbox(tmp_path)
+    cmd = "cd /mnt/user-data/workspace && unzip -o demo.zip"
+
+    native = sb._resolve_paths_in_command(cmd)
+    posix = sb._resolve_paths_in_command(cmd, posix_paths=True)
+
+    assert "\\" not in posix
+    assert posix == native.replace("\\", "/")
+    # The virtual prefix is actually resolved (not passed through verbatim).
+    assert "/mnt/user-data/workspace" not in posix
+
+
+def test_execute_command_uses_posix_paths_for_msys_shell(tmp_path):
+    """execute_command must resolve paths in forward-slash form when the selected
+    shell is Git Bash/MSYS, so `cd /mnt/...` survives instead of being mangled."""
+    sb = _make_sandbox(tmp_path)
+    fake_msys_sh = "C:/Program Files/Git/usr/bin/sh.exe"
+
+    with (
+        mock.patch.object(sb, "_get_shell", return_value=fake_msys_sh),
+        mock.patch(
+            "deerflow.sandbox.local.local_sandbox.subprocess.run",
+            return_value=SimpleNamespace(stdout="ok", stderr="", returncode=0),
+        ) as run,
+    ):
+        sb.execute_command("cd /mnt/user-data/workspace && unzip -o demo.zip")
+
+    # The command string handed to the shell (last positional arg) must carry a
+    # forward-slash host path and no backslashes, and must not still contain the
+    # unresolved virtual prefix.
+    sent_args = run.call_args.args[0]
+    command_str = sent_args[-1]
+    assert "\\" not in command_str
+    assert "/mnt/user-data/workspace" not in command_str

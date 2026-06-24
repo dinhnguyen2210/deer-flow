@@ -253,12 +253,17 @@ class LocalSandbox(Sandbox):
 
         return result
 
-    def _resolve_paths_in_command(self, command: str) -> str:
+    def _resolve_paths_in_command(self, command: str, *, posix_paths: bool = False) -> str:
         """
         Resolve container paths to local paths in a command string.
 
         Args:
             command: Command string that may contain container paths
+            posix_paths: When True, emit resolved host paths with forward slashes
+                (e.g. ``D:/foo`` instead of ``D:\\foo``). Required for MSYS/Git Bash
+                shells, where the backslashes of a Windows path are eaten as escape
+                characters by ``sh`` and the path is destroyed (e.g. ``cd D:\\a\\b``
+                becomes ``cd D:ab``). Git Bash accepts the forward-slash drive form.
 
         Returns:
             Command with container paths resolved to local paths
@@ -269,7 +274,8 @@ class LocalSandbox(Sandbox):
 
         def replace_match(match: re.Match) -> str:
             matched_path = match.group(0)
-            return self._resolve_path(matched_path)
+            resolved = self._resolve_path(matched_path)
+            return resolved.replace("\\", "/") if posix_paths else resolved
 
         return pattern.sub(replace_match, command)
 
@@ -328,9 +334,11 @@ class LocalSandbox(Sandbox):
         raise RuntimeError("No suitable shell executable found. Tried /bin/zsh, /bin/bash, /bin/sh, and `sh` on PATH.")
 
     def execute_command(self, command: str) -> str:
-        # Resolve container paths in command before execution
-        resolved_command = self._resolve_paths_in_command(command)
+        # Determine the shell first: MSYS/Git Bash needs resolved host paths in
+        # forward-slash form, since its `sh` treats the backslashes of a Windows
+        # path as escape characters and destroys the path.
         shell = self._get_shell()
+        resolved_command = self._resolve_paths_in_command(command, posix_paths=self._is_msys_shell(shell))
 
         if os.name == "nt":
             env = None
