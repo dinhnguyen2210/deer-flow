@@ -26,7 +26,7 @@ from typing import Any
 
 import anthropic
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from pydantic import PrivateAttr
 
 logger = logging.getLogger(__name__)
@@ -75,6 +75,49 @@ def _ensure_consecutive_system_messages(messages: list[BaseMessage]) -> tuple[li
             in_leading_block = False
             result.append(message)
     return result, demoted
+
+
+def _strip_error_fallback_messages(messages: list[BaseMessage]) -> tuple[list[BaseMessage], int]:
+    """Drop DeerFlow error-fallback messages before they reach the model.
+
+    ``LLMErrorHandlingMiddleware`` synthesizes ``AIMessage``s tagged with
+    ``additional_kwargs["deerflow_error_fallback"]`` (e.g. "The configured LLM
+    provider is temporarily unavailable…") purely to show the user a graceful
+    notice. They are persisted in the checkpoint, so on the next turn they would
+    be replayed to the model as if they were genuine assistant output — and when
+    one is the last message, it forms an illegal assistant *prefill* that
+    Anthropic OAuth rejects with "the conversation must end with a user message",
+    which itself produces another fallback and poisons the thread permanently.
+
+    These messages are never real model input, so we strip them on every request.
+    Returns the filtered list and the number removed. If filtering would empty
+    the list, the original is returned unchanged (defensive; never happens in
+    practice because a system prompt + user turn always precede a fallback).
+    """
+    filtered = [m for m in messages if not (isinstance(getattr(m, "additional_kwargs", None), dict) and m.additional_kwargs.get("deerflow_error_fallback"))]
+    removed = len(messages) - len(filtered)
+    if removed and not filtered:
+        return messages, 0
+    return filtered, removed
+
+
+def _strip_trailing_assistant_messages(messages: list[BaseMessage]) -> tuple[list[BaseMessage], int]:
+    """Ensure the request does not end on an assistant message.
+
+    Claude Code OAuth tokens do not support assistant message prefill: the
+    conversation must end with a user (or tool-result) turn. DeerFlow's agent
+    loop never intends to prefill, so a trailing ``AIMessage`` is always an
+    accident (a poisoned checkpoint, a mis-rolled-back regenerate, etc.). Drop
+    trailing assistant messages so the payload ends on the preceding user/tool
+    turn and the model generates a fresh response. Returns the trimmed list and
+    the number removed; never trims below one message.
+    """
+    trimmed = list(messages)
+    removed = 0
+    while len(trimmed) > 1 and isinstance(trimmed[-1], AIMessage):
+        trimmed.pop()
+        removed += 1
+    return trimmed, removed
 
 
 # Billing header required by Anthropic API for OAuth token access.
@@ -182,11 +225,28 @@ class ClaudeChatModel(ChatAnthropic):
         **kwargs: Any,
     ) -> dict:
         """Override to inject prompt caching, thinking budget, and OAuth billing."""
+        messages = self._convert_input(input_).to_messages()
+
+        # Drop DeerFlow error-fallback notices — they are UI-only messages that
+        # must never be replayed as assistant turns. Persisted at the tail of a
+        # failed turn, they otherwise form an illegal assistant prefill that
+        # poisons the thread (see _strip_error_fallback_messages).
+        messages, dropped_fallbacks = _strip_error_fallback_messages(messages)
+        if dropped_fallbacks:
+            logger.warning("ClaudeChatModel: stripped %d DeerFlow error-fallback message(s) before sending to the model", dropped_fallbacks)
+
+        # OAuth tokens reject assistant prefill, so the request must not end on an
+        # assistant message. Defensively trim any trailing AIMessage left by a
+        # poisoned checkpoint or a mis-rolled-back regenerate.
+        if self._is_oauth:
+            messages, trimmed = _strip_trailing_assistant_messages(messages)
+            if trimmed:
+                logger.warning("ClaudeChatModel: trimmed %d trailing assistant message(s) to satisfy OAuth no-prefill constraint", trimmed)
+
         # Anthropic requires all system content to be consecutive at the front.
-        # Normalize first so any mid-conversation SystemMessage (summary push-down,
+        # Normalize so any mid-conversation SystemMessage (summary push-down,
         # poisoned checkpoint, etc.) cannot raise "multiple non-consecutive system
         # messages" inside super()._get_request_payload -> _format_messages.
-        messages = self._convert_input(input_).to_messages()
         messages, demoted = _ensure_consecutive_system_messages(messages)
         if demoted:
             logger.warning("ClaudeChatModel: demoted %d non-leading SystemMessage(s) to HumanMessage to keep system content consecutive", demoted)
