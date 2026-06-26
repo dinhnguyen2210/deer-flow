@@ -6,6 +6,9 @@ Implements two credential strategies:
      - Requires anthropic-beta: oauth-2025-04-20,claude-code-20250219
      - Supports $CLAUDE_CODE_OAUTH_TOKEN, $CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR, and $ANTHROPIC_AUTH_TOKEN
      - Override path with $CLAUDE_CODE_CREDENTIALS_PATH
+     - When a file-backed access token is expired, the stored refresh token is
+       exchanged for a fresh one and written back, so runs self-heal instead of
+       failing with "Could not resolve authentication method"
   2. Codex CLI token from ~/.codex/auth.json
      - Uses chatgpt.com/backend-api/codex/responses endpoint
      - Supports both legacy top-level tokens and current nested tokens shape
@@ -24,6 +27,14 @@ logger = logging.getLogger(__name__)
 
 # Required beta headers for Claude Code OAuth tokens
 OAUTH_ANTHROPIC_BETAS = "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14"
+
+# Public Claude Code OAuth client used for the refresh-token grant. These are the
+# same well-known values the Claude Code CLI itself uses to mint new access
+# tokens, so DeerFlow can self-heal an expired token from the stored refresh
+# token instead of failing the request with an auth error.
+OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+OAUTH_REFRESH_TIMEOUT_S = 30.0
 
 
 def is_oauth_token(token: str) -> bool:
@@ -125,7 +136,105 @@ def _iter_claude_code_credential_paths() -> list[Path]:
     return paths
 
 
-def _extract_claude_code_credential(data: dict[str, Any], source: str) -> ClaudeCodeCredential | None:
+def _request_oauth_token(refresh_token: str) -> dict[str, Any] | None:
+    """Exchange a Claude Code refresh token for a fresh access token.
+
+    Returns the parsed token JSON (``access_token``/``refresh_token``/
+    ``expires_in``) on success, or ``None`` if the request fails or is rejected.
+    Kept as a thin seam so the network call is easy to stub in tests.
+    """
+    try:
+        import httpx
+
+        response = httpx.post(
+            OAUTH_TOKEN_URL,
+            json={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": OAUTH_CLIENT_ID,
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=OAUTH_REFRESH_TIMEOUT_S,
+        )
+    except Exception as e:
+        logger.warning(f"Claude Code OAuth refresh request failed: {e}")
+        return None
+
+    if response.status_code != 200:
+        logger.warning(f"Claude Code OAuth refresh rejected (HTTP {response.status_code}). Run 'claude' to refresh.")
+        return None
+
+    try:
+        return response.json()
+    except (ValueError, json.JSONDecodeError):
+        logger.warning("Claude Code OAuth refresh returned an unparseable response")
+        return None
+
+
+def _persist_credentials(path: Path, data: dict[str, Any]) -> None:
+    """Atomically write refreshed credentials back to disk, preserving file mode."""
+    tmp_path = path.parent / f"{path.name}.tmp"
+    try:
+        tmp_path.write_text(json.dumps(data, indent=2))
+        mode: int | None = None
+        try:
+            mode = path.stat().st_mode
+        except OSError:
+            mode = None
+        os.replace(tmp_path, path)
+        if mode is not None:
+            try:
+                os.chmod(path, mode & 0o777)
+            except OSError:
+                pass
+    except OSError as e:
+        logger.warning(f"Failed to persist refreshed Claude Code credentials: {e}")
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _refresh_claude_code_credential(data: dict[str, Any], oauth: dict[str, Any], path: Path, source: str) -> ClaudeCodeCredential | None:
+    """Refresh an expired token via the stored refresh token and persist the result."""
+    refresh_token = oauth.get("refreshToken", "")
+    if not refresh_token:
+        logger.warning("Claude Code OAuth token is expired and no refresh token is available. Run 'claude' to refresh.")
+        return None
+
+    token_json = _request_oauth_token(refresh_token)
+    if not token_json:
+        logger.warning("Claude Code OAuth token is expired and automatic refresh failed. Run 'claude' to refresh.")
+        return None
+
+    new_access = token_json.get("access_token", "")
+    if not new_access:
+        logger.warning("Claude Code OAuth refresh response did not contain an access token. Run 'claude' to refresh.")
+        return None
+
+    new_refresh = token_json.get("refresh_token") or refresh_token
+    expires_in = token_json.get("expires_in")
+    new_expires_at = int(time.time() * 1000 + float(expires_in) * 1000) if expires_in else 0
+
+    new_oauth = dict(oauth)
+    new_oauth["accessToken"] = new_access
+    new_oauth["refreshToken"] = new_refresh
+    if new_expires_at:
+        new_oauth["expiresAt"] = new_expires_at
+    new_data = dict(data)
+    new_data["claudeAiOauth"] = new_oauth
+    _persist_credentials(path, new_data)
+
+    logger.info("Refreshed expired Claude Code OAuth token automatically")
+    return ClaudeCodeCredential(
+        access_token=new_access,
+        refresh_token=new_refresh,
+        expires_at=new_expires_at,
+        source=source,
+    )
+
+
+def _extract_claude_code_credential(data: dict[str, Any], source: str, path: Path | None = None) -> ClaudeCodeCredential | None:
     oauth = data.get("claudeAiOauth", {})
     access_token = oauth.get("accessToken", "")
     if not access_token:
@@ -140,7 +249,14 @@ def _extract_claude_code_credential(data: dict[str, Any], source: str) -> Claude
     )
 
     if cred.is_expired:
-        logger.warning("Claude Code OAuth token is expired. Run 'claude' to refresh.")
+        # Self-heal from the stored refresh token (only possible for file-backed
+        # credentials, where we can write the rotated token back).
+        if path is not None:
+            refreshed = _refresh_claude_code_credential(data, oauth, path, source)
+            if refreshed:
+                return refreshed
+        else:
+            logger.warning("Claude Code OAuth token is expired. Run 'claude' to refresh.")
         return None
 
     return cred
@@ -186,7 +302,7 @@ def load_claude_code_credential() -> ClaudeCodeCredential | None:
         data = _load_json_file(cred_path, "Claude Code credentials")
         if data is None:
             continue
-        cred = _extract_claude_code_credential(data, "claude-cli-file")
+        cred = _extract_claude_code_credential(data, "claude-cli-file", path=cred_path)
         if cred:
             source_label = "override path" if override_path_obj is not None and cred_path == override_path_obj else "plaintext file"
             logger.info(f"Loaded Claude Code OAuth credential from {source_label} (expires_at={cred.expires_at})")
