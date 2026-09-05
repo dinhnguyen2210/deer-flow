@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import socket
 import time
 import uuid
@@ -75,6 +76,109 @@ def _ensure_consecutive_system_messages(messages: list[BaseMessage]) -> tuple[li
             in_leading_block = False
             result.append(message)
     return result, demoted
+
+
+# Matches a UTF-16 surrogate pair, a BMP ``\uXXXX``, or an astral ``\U00XXXXXX``
+# escape written as *literal* backslash characters (not a real control char).
+_STRAY_ESCAPE_RE = re.compile(
+    r"\\u([dD][89abAB][0-9a-fA-F]{2})\\u([dD][c-fC-F][0-9a-fA-F]{2})"  # UTF-16 surrogate pair
+    r"|\\U([0-9a-fA-F]{8})"  # astral \U00XXXXXX (uppercase U, must precede \u)
+    r"|\\u([0-9a-fA-F]{4})",  # BMP \uXXXX
+)
+
+# Only decode escapes that resolve to a real non-ASCII character (>= U+00A0).
+# This repairs Vietnamese/CJK text while leaving ASCII escapes (``A``), C0/C1
+# control escapes, and code/regex snippets that legitimately contain ``\uXXXX``
+# untouched.
+_MIN_DECODABLE_CODEPOINT = 0xA0
+
+
+def _decode_stray_escape(match: "re.Match[str]") -> str:
+    """Replace one matched escape with its character, or leave it verbatim.
+
+    Verbatim (unchanged) when: the code point is ASCII / C1-control (< U+00A0), a
+    lone surrogate, or otherwise not a valid character. This keeps the transform
+    conservative — it only ever *repairs* leaked human-language text.
+    """
+    hi, lo, astral, bmp = match.groups()
+    try:
+        if hi and lo:
+            code = 0x10000 + ((int(hi, 16) - 0xD800) << 10) + (int(lo, 16) - 0xDC00)
+        elif bmp is not None:
+            code = int(bmp, 16)
+        else:
+            code = int(astral, 16)
+    except (TypeError, ValueError):
+        return match.group(0)
+    if code < _MIN_DECODABLE_CODEPOINT or code > 0x10FFFF or 0xD800 <= code <= 0xDFFF:
+        return match.group(0)
+    try:
+        return chr(code)
+    except (ValueError, OverflowError):
+        return match.group(0)
+
+
+def _repair_text(value: str) -> str:
+    """Decode stray ``\\uXXXX`` sequences in ``value`` (fast no-op when absent)."""
+    if "\\u" not in value and "\\U" not in value:
+        return value
+    return _STRAY_ESCAPE_RE.sub(_decode_stray_escape, value)
+
+
+def _repair_obj(obj: Any) -> Any:
+    """Recursively repair every string inside ``obj`` (dict/list/str)."""
+    if isinstance(obj, str):
+        return _repair_text(obj)
+    if isinstance(obj, dict):
+        return {key: _repair_obj(val) for key, val in obj.items()}
+    if isinstance(obj, list):
+        return [_repair_obj(item) for item in obj]
+    return obj
+
+
+def _decode_stray_unicode_escapes(messages: list[BaseMessage]) -> tuple[list[BaseMessage], int]:
+    """Repair human-language text that leaked into history as literal ``\\uXXXX``.
+
+    Once any string value (typically a tool-call argument like ``"description":
+    "T\\u00ecm"``) enters the conversation as *literal* backslash-u characters
+    instead of the real character (``Tìm``), it is a stable fixed point: every
+    ``json.dumps``/``json.loads`` round-trip preserves it verbatim, and the model —
+    seeing its own history rendered as ``\\uXXXX`` — reproduces the pattern in new
+    tool calls *and* in prose (writing ``C\\u00e1c`` while still emitting emoji
+    raw). The result is a self-reinforcing poison loop, in the same family as the
+    assistant-prefill loop guarded by :func:`_strip_error_fallback_messages`.
+
+    We break the loop at the request boundary: decode stray escapes in every
+    outgoing message's content and tool-call args so the model stops seeing (and
+    reproducing) them. The decode is conservative — only escapes resolving to a
+    real non-ASCII character (>= U+00A0) are touched, leaving ASCII escapes and
+    genuine code/regex snippets alone (see :func:`_decode_stray_escape`).
+
+    Returns the rewritten list and the number of messages that were repaired.
+    """
+    repaired: list[BaseMessage] = []
+    repaired_count = 0
+    for message in messages:
+        updates: dict[str, Any] = {}
+
+        content = getattr(message, "content", None)
+        if isinstance(content, (str, list)):
+            new_content = _repair_obj(content)
+            if new_content != content:
+                updates["content"] = new_content
+
+        tool_calls = getattr(message, "tool_calls", None)
+        if tool_calls:
+            new_tool_calls = _repair_obj(tool_calls)
+            if new_tool_calls != tool_calls:
+                updates["tool_calls"] = new_tool_calls
+
+        if updates:
+            repaired.append(message.model_copy(update=updates))
+            repaired_count += 1
+        else:
+            repaired.append(message)
+    return repaired, repaired_count
 
 
 def _strip_error_fallback_messages(messages: list[BaseMessage]) -> tuple[list[BaseMessage], int]:
@@ -250,6 +354,14 @@ class ClaudeChatModel(ChatAnthropic):
         messages, demoted = _ensure_consecutive_system_messages(messages)
         if demoted:
             logger.warning("ClaudeChatModel: demoted %d non-leading SystemMessage(s) to HumanMessage to keep system content consecutive", demoted)
+
+        # Repair human-language text that leaked into history as literal \uXXXX
+        # escapes (e.g. a tool-call arg "Tìm" instead of "Tìm"). Left alone,
+        # the model mirrors the pattern into new tool calls and prose, forming a
+        # self-reinforcing poison loop (see _decode_stray_unicode_escapes).
+        messages, repaired = _decode_stray_unicode_escapes(messages)
+        if repaired:
+            logger.warning("ClaudeChatModel: decoded stray \\uXXXX escape sequences in %d message(s) to break the escape poison loop", repaired)
 
         payload = super()._get_request_payload(messages, stop=stop, **kwargs)
 
