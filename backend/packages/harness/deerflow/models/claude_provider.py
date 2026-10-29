@@ -30,7 +30,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from pydantic import PrivateAttr
 
-from deerflow.utils.retry_after import bounded_retry_after_ms
+from deerflow.utils.retry_after import bounded_retry_after_ms, parse_retry_after_date_ms
 
 logger = logging.getLogger(__name__)
 
@@ -663,6 +663,8 @@ class ClaudeChatModel(ChatAnthropic):
                     if hint_ms is not None:
                         total_ms = hint_ms
                 except (ValueError, TypeError, OverflowError):
-                    pass
+                    hint_ms = parse_retry_after_date_ms(retry_after, now=time.time())
+                    if hint_ms is not None:
+                        total_ms = hint_ms
 
         return total_ms
